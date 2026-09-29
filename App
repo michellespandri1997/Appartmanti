@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+import random
+from calendar import monthrange
+from datetime import date, timedelta
+
+import pandas as pd
+import streamlit as st
+
+
+st.set_page_config(
+    page_title="Soggiorni Milano",
+    page_icon=":material/apartment:",
+    layout="wide",
+)
+
+TODAY = date.today()
+PROPERTIES = {
+    "Brera Loft": {
+        "zona": "Brera · Milano centro",
+        "ospiti": 4,
+        "tariffa": 178,
+        "image": "https://images.unsplash.com/photo-1600210492486-724fe5c67fb0?auto=format&fit=crop&w=1100&q=85",
+    },
+    "Navigli Studio": {
+        "zona": "Navigli · Darsena",
+        "ospiti": 2,
+        "tariffa": 132,
+        "image": "https://images.unsplash.com/photo-1600607687939-ce8a6c25118c?auto=format&fit=crop&w=1100&q=85",
+    },
+}
+CHANNEL_FEES = {"Booking.com": 0.15, "Airbnb": 0.14, "Diretto": 0.0}
+
+
+def shift_month(value: date, offset: int) -> date:
+    month_index = value.year * 12 + value.month - 1 + offset
+    year, month = divmod(month_index, 12)
+    return date(year, month + 1, 1)
+
+
+def make_demo_bookings() -> pd.DataFrame:
+    rng = random.Random(218)
+    names = ["Giulia R.", "Marco B.", "Elena C.", "Luca F.", "Sara M.", "Andrea P.", "Nadia T.", "Paolo G."]
+    channels = ["Booking.com", "Booking.com", "Booking.com", "Airbnb", "Airbnb", "Diretto"]
+    records: list[dict] = []
+    first_month = shift_month(TODAY.replace(day=1), -18)
+    last_month = shift_month(TODAY.replace(day=1), 4)
+    booking_number = 1001
+
+    for property_name, details in PROPERTIES.items():
+        month_start = first_month
+        while month_start <= last_month:
+            month_end = shift_month(month_start, 1)
+            arrival = month_start + timedelta(days=rng.randint(0, 5))
+            while arrival < month_end:
+                nights = rng.randint(2, 5)
+                departure = arrival + timedelta(days=nights)
+                if departure > TODAY:
+                    status = "Confermata"
+                    if arrival <= TODAY:
+                        status = "In soggiorno"
+                else:
+                    status = "Completata"
+                if rng.random() < (0.07 if departure <= TODAY else 0.035):
+                    status = "Annullata"
+
+                month = arrival.month
+                seasonal_factor = 1.22 if month in (4, 5, 6, 9, 10) else 1.32 if month in (2, 12) else 0.91 if month in (1, 7, 8) else 1.0
+                nightly_rate = round(details["tariffa"] * seasonal_factor * rng.uniform(0.88, 1.16))
+                channel = rng.choice(channels)
+                gross = nightly_rate * nights
+                records.append(
+                    {
+                        "Codice": f"MI-{booking_number}",
+                        "Appartamento": property_name,
+                        "Ospite": rng.choice(names),
+                        "Check-in": arrival,
+                        "Check-out": departure,
+                        "Notti": nights,
+                        "Ospiti": rng.randint(1, details["ospiti"]),
+                        "Canale": channel,
+                        "Stato": status,
+                        "Tariffa/notte": nightly_rate,
+                        "Importo": gross,
+                        "Commissione": round(gross * CHANNEL_FEES[channel]),
+                    }
+                )
+                booking_number += 1
+                arrival += timedelta(days=nights + rng.randint(2, 7))
+            month_start = month_end
+
+    return pd.DataFrame(records)
+
+
+def get_bookings() -> pd.DataFrame:
+    if "extra_bookings" not in st.session_state:
+        st.session_state.extra_bookings = []
+    bookings = pd.concat(
+        [make_demo_bookings(), pd.DataFrame(st.session_state.extra_bookings)],
+        ignore_index=True,
+    )
+    for column in ("Check-in", "Check-out"):
+        bookings[column] = pd.to_datetime(bookings[column]).dt.date
+    return bookings
+
+
+def nights_in_period(row: pd.Series, period_start: date, period_end: date) -> int:
+    start = max(row["Check-in"], period_start)
+    end = min(row["Check-out"], period_end)
+    return max(0, (end - start).days)
+
+
+def monthly_performance(bookings: pd.DataFrame, property_names: list[str]) -> pd.DataFrame:
+    active = bookings[
+        bookings["Appartamento"].isin(property_names) & bookings["Stato"].ne("Annullata")
+    ]
+    months = [shift_month(TODAY.replace(day=1), offset) for offset in range(-11, 3)]
+    rows = []
+    for month_start in months:
+        month_end = shift_month(month_start, 1)
+        available_nights = (month_end - month_start).days * len(property_names)
+        booked_nights = sum(nights_in_period(row, month_start, month_end) for _, row in active.iterrows())
+        revenue = sum(
+            nights_in_period(row, month_start, month_end) * row["Tariffa/notte"]
+            for _, row in active.iterrows()
+        )
+        rows.append(
+            {
+                "Mese": month_start,
+                "Occupazione": round(100 * booked_nights / available_nights, 1) if available_nights else 0,
+                "Ricavi lordi": revenue,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def euro(value: float | int) -> str:
+    return f"€ {value:,.0f}".replace(",", ".")
+
+
+def add_booking(bookings: pd.DataFrame) -> None:
+    with st.form("new_booking", clear_on_submit=True):
+        left, right = st.columns(2)
+        with left:
+            property_name = st.selectbox("Appartamento", list(PROPERTIES))
+            guest = st.text_input("Nome ospite")
+            check_in = st.date_input("Check-in", value=TODAY + timedelta(days=14))
+            channel = st.selectbox("Canale", list(CHANNEL_FEES))
+        with right:
+            guests = st.number_input("Numero ospiti", min_value=1, max_value=4, value=2)
+            check_out = st.date_input("Check-out", value=TODAY + timedelta(days=17))
+            nightly_rate = st.number_input(
+                "Tariffa a notte (€)", min_value=40, max_value=1500,
+                value=PROPERTIES[property_name]["tariffa"], step=5,
+            )
+        submitted = st.form_submit_button("Aggiungi prenotazione", type="primary", icon=":material/add:")
+
+    if submitted:
+        if not guest.strip():
+            st.error("Inserisci il nome dell'ospite.")
+        elif check_out <= check_in:
+            st.error("Il check-out deve essere successivo al check-in.")
+        elif guests > PROPERTIES[property_name]["ospiti"]:
+            st.error(f"{property_name} può ospitare al massimo {PROPERTIES[property_name]['ospiti']} persone.")
+        else:
+            nights = (check_out - check_in).days
+            gross = int(nightly_rate) * nights
+            st.session_state.extra_bookings.append(
+                {
+                    "Codice": f"MI-N{len(bookings) + 1}",
+                    "Appartamento": property_name,
+                    "Ospite": guest.strip(),
+                    "Check-in": check_in,
+                    "Check-out": check_out,
+                    "Notti": nights,
+                    "Ospiti": int(guests),
+                    "Canale": channel,
+                    "Stato": "Confermata",
+                    "Tariffa/notte": int(nightly_rate),
+                    "Importo": gross,
+                    "Commissione": round(gross * CHANNEL_FEES[channel]),
+                }
+            )
+            st.toast("Prenotazione aggiunta alla demo", icon=":material/check_circle:")
+            st.rerun()
+
+
+bookings = get_bookings()
+
+with st.sidebar:
+    st.markdown("## MILANO / STAY")
+    st.caption("Gestione di due case")
+    page = st.segmented_control(
+        "Sezione",
+        ["Panoramica", "Prenotazioni", "Analisi", "Suggerimenti"],
+        default="Panoramica",
+        key="section",
+        width="stretch",
+    )
+    selected_properties = st.multiselect(
+        "Appartamenti",
+        list(PROPERTIES),
+        default=list(PROPERTIES),
+    )
+    st.caption("Dati dimostrativi generati localmente. Nessuna connessione a Booking.com o Airbnb.")
+
+if not selected_properties:
+    st.warning("Seleziona almeno un appartamento dalla barra laterale.")
+    st.stop()
+
+filtered = bookings[bookings["Appartamento"].isin(selected_properties)].copy()
+active = filtered[filtered["Stato"].ne("Annullata")]
+performance = monthly_performance(bookings, selected_properties)
+future_end = TODAY + timedelta(days=30)
+upcoming_nights = sum(nights_in_period(row, TODAY, future_end) for _, row in active.iterrows())
+available_next_month = 30 * len(selected_properties)
+occupancy_next_month = 100 * upcoming_nights / available_next_month if available_next_month else 0
+revenue_next_month = sum(
+    nights_in_period(row, TODAY, future_end) * row["Tariffa/notte"] for _, row in active.iterrows()
+)
+arrivals_week = int(
+    (
+        filtered["Check-in"].between(TODAY, TODAY + timedelta(days=7))
+        & filtered["Stato"].ne("Annullata")
+    ).sum()
+)
+historical = active[
+    (active["Check-out"] <= TODAY)
+    & (active["Check-in"] >= TODAY - timedelta(days=365))
+]
+avg_nightly_rate = (
+    (historical["Importo"].sum() / historical["Notti"].sum()) if historical["Notti"].sum() else 0
+)
+
+st.title("Soggiorni Milano", icon=":material/apartment:")
+st.caption(f"Il quadro operativo dei tuoi appartamenti · {TODAY.strftime('%d/%m/%Y')}")
+
+if page == "Panoramica":
+    with st.container(horizontal=True):
+        st.metric("Occupazione prossimi 30 gg", f"{occupancy_next_month:.0f}%", border=True)
+        st.metric("Ricavi prenotati · 30 gg", euro(revenue_next_month), border=True)
+        st.metric("Arrivi · prossimi 7 gg", arrivals_week, border=True)
+        st.metric("Tariffa media · 12 mesi", euro(avg_nightly_rate), border=True)
+
+    st.header("I tuoi appartamenti", anchor=False)
+    property_columns = st.columns(len(selected_properties))
+    for column, property_name in zip(property_columns, selected_properties):
+        details = PROPERTIES[property_name]
+        with column:
+            with st.container(border=True):
+                st.image(details["image"], caption=details["zona"], width="stretch")
+                st.subheader(property_name, anchor=False)
+                st.caption(f"Fino a {details['ospiti']} ospiti · tariffa guida {euro(details['tariffa'])}/notte")
+                property_rows = active[active["Appartamento"].eq(property_name)]
+                next_arrivals = property_rows[property_rows["Check-in"] >= TODAY].sort_values("Check-in")
+                if not next_arrivals.empty:
+                    next_stay = next_arrivals.iloc[0]
+                    st.write(f"Prossimo arrivo: **{next_stay['Check-in'].strftime('%d/%m')}** · {next_stay['Ospite']}")
+                else:
+                    st.write("Nessun arrivo futuro in agenda")
+
+    chart_left, chart_right = st.columns([1.5, 1])
+    with chart_left:
+        st.subheader("Occupazione mensile", anchor=False)
+        st.line_chart(performance.set_index("Mese")["Occupazione"], y_label="Notti occupate (%)", color="#26715C")
+    with chart_right:
+        st.subheader("Prenotazioni per canale", anchor=False)
+        channel_counts = (
+            filtered[filtered["Stato"].ne("Annullata")]["Canale"]
+            .value_counts()
+            .rename_axis("Canale")
+            .reset_index(name="Prenotazioni")
+        )
+        st.bar_chart(channel_counts, x="Canale", y="Prenotazioni", color="#C16B45")
+
+    st.subheader("Prossimi arrivi", anchor=False)
+    next_arrivals = active[active["Check-in"].between(TODAY, TODAY + timedelta(days=30))].sort_values("Check-in")
+    st.dataframe(
+        next_arrivals[["Check-in", "Appartamento", "Ospite", "Notti", "Canale", "Stato"]],
+        hide_index=True,
+        column_config={"Check-in": st.column_config.DateColumn("Check-in", format="DD/MM/YYYY")},
+        height=245,
+    )
+
+elif page == "Prenotazioni":
+    st.header("Prenotazioni", anchor=False)
+    st.caption("Cerca nel registro demo o aggiungi un soggiorno per provarne i flussi.")
+    with st.expander("Nuova prenotazione", icon=":material/add:"):
+        add_booking(filtered)
+
+    filter_columns = st.columns(3)
+    with filter_columns[0]:
+        date_range = st.date_input(
+            "Arrivo nel periodo",
+            value=(TODAY - timedelta(days=90), TODAY + timedelta(days=120)),
+            format="DD/MM/YYYY",
+        )
+    with filter_columns[1]:
+        channel_filter = st.multiselect("Canale", sorted(filtered["Canale"].unique()), default=sorted(filtered["Canale"].unique()))
+    with filter_columns[2]:
+        status_filter = st.multiselect("Stato", sorted(filtered["Stato"].unique()), default=sorted(filtered["Stato"].unique()))
+
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        start_date, end_date = date_range
+        table = filtered[
+            filtered["Check-in"].between(start_date, end_date)
+            & filtered["Canale"].isin(channel_filter)
+            & filtered["Stato"].isin(status_filter)
+        ].sort_values("Check-in", ascending=False)
+    else:
+        table = filtered.iloc[0:0]
+
+    st.caption(f"{len(table)} prenotazioni nel periodo selezionato")
+    st.dataframe(
+        table[["Codice", "Check-in", "Check-out", "Appartamento", "Ospite", "Ospiti", "Notti", "Canale", "Stato", "Importo"]],
+        hide_index=True,
+        height=500,
+        column_config={
+            "Check-in": st.column_config.DateColumn("Check-in", format="DD/MM/YYYY"),
+            "Check-out": st.column_config.DateColumn("Check-out", format="DD/MM/YYYY"),
+            "Importo": st.column_config.NumberColumn("Importo", format="€ %d"),
+        },
+    )
+    st.download_button(
+        "Esporta CSV",
+        table.to_csv(index=False).encode("utf-8-sig"),
+        file_name="prenotazioni_milano_demo.csv",
+        mime="text/csv",
+        icon=":material/download:",
+    )
+
+elif page == "Analisi":
+    st.header("Andamento e ricavi", anchor=False)
+    st.caption("Confronta stagionalità, tariffe e composizione delle prenotazioni.")
+    chart_left, chart_right = st.columns(2)
+    with chart_left:
+        st.subheader("Tasso di occupazione", anchor=False)
+        st.line_chart(performance.set_index("Mese")["Occupazione"], y_label="Occupazione (%)", color="#26715C")
+    with chart_right:
+        st.subheader("Ricavi lordi per mese", anchor=False)
+        st.bar_chart(performance.set_index("Mese")["Ricavi lordi"], y_label="Ricavi (€)", color="#C16B45")
+
+    st.subheader("Confronto appartamenti · ultimi 12 mesi", anchor=False)
+    comparison_rows = []
+    year_start = TODAY - timedelta(days=365)
+    for property_name in selected_properties:
+        stays = active[
+            active["Appartamento"].eq(property_name)
+            & (active["Check-out"] <= TODAY)
+            & (active["Check-in"] >= year_start)
+        ]
+        nights = int(stays["Notti"].sum())
+        comparison_rows.append(
+            {
+                "Appartamento": property_name,
+                "Soggiorni conclusi": len(stays),
+                "Notti vendute": nights,
+                "Tariffa media": round(stays["Importo"].sum() / nights) if nights else 0,
+                "Ricavi lordi": int(stays["Importo"].sum()),
+                "Commissioni stimate": int(stays["Commissione"].sum()),
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(comparison_rows),
+        hide_index=True,
+        column_config={
+            "Tariffa media": st.column_config.NumberColumn(format="€ %d"),
+            "Ricavi lordi": st.column_config.NumberColumn(format="€ %d"),
+            "Commissioni stimate": st.column_config.NumberColumn(format="€ %d"),
+        },
+    )
+    st.caption("Ricavi e commissioni sono stime sui dati dimostrativi, prima di imposte e costi di gestione.")
+
+else:
+    st.header("Suggerimenti operativi", anchor=False)
+    st.caption("Indicazioni generate dalle prenotazioni demo: usale come spunto, non come previsione garantita.")
+    next_month_occupancy = float(performance.iloc[-1]["Occupazione"])
+    completed_channels = historical["Canale"].value_counts(normalize=True)
+    booking_share = float(completed_channels.get("Booking.com", 0))
+    gross_history = int(historical["Importo"].sum())
+    fees_history = int(historical["Commissione"].sum())
+    direct_opportunity = int(gross_history * 0.10 * 0.14)
+
+    if next_month_occupancy < 45:
+        st.warning(
+            f"**Riempi le date vicine.** L'occupazione prevista per il prossimo mese è {next_month_occupancy:.0f}%. "
+            "Valuta una promozione mirata nei giorni feriali o una riduzione del soggiorno minimo.",
+            icon=":material/event_available:",
+        )
+    else:
+        st.success(
+            f"**Domanda in buon andamento.** Il prossimo mese è occupato al {next_month_occupancy:.0f}%. "
+            "Controlla le date con poca disponibilità prima di applicare sconti generalizzati.",
+            icon=":material/trending_up:",
+        )
+
+    if booking_share > 0.60:
+        st.info(
+            f"**Riduci la dipendenza da un solo canale.** Booking.com rappresenta il {booking_share:.0%} "
+            f"dei soggiorni conclusi. Un piano di ritorno ospiti diretti potrebbe valere circa {euro(direct_opportunity)} "
+            "di commissioni evitate, ipotizzando di spostare il 10% dei ricavi storici.",
+            icon=":material/account_balance_wallet:",
+        )
+    else:
+        st.info(
+            f"**Misura il costo dei canali.** Nei dati demo le commissioni stimate degli ultimi 12 mesi sono {euro(fees_history)}. "
+            "Registra anche le prenotazioni dirette per confrontare il ricavo netto per notte.",
+            icon=":material/receipt_long:",
+        )
+
+    canceled = int((filtered["Stato"] == "Annullata").sum())
+    cancellation_rate = canceled / max(1, len(filtered))
+    if cancellation_rate > 0.08:
+        st.warning(
+            f"**Tieni d'occhio le cancellazioni.** Nel campione sono il {cancellation_rate:.0%}. "
+            "Verifica le condizioni di cancellazione e l'anticipo medio di prenotazione.",
+            icon=":material/notification_important:",
+        )
+    else:
+        st.info(
+            f"**Raccogli più segnali sulla domanda.** Il campione mostra un tasso di cancellazione del {cancellation_rate:.0%}. "
+            "Annota richieste non convertite e giorni della settimana per affinare prezzi e soggiorno minimo.",
+            icon=":material/lightbulb:",
+        )
+
+    with st.expander("Come leggere queste stime"):
+        st.write(
+            "La demo usa una serie sintetica di soggiorni, tariffe stagionali indicative e commissioni convenzionali "
+            "del 15% per Booking.com e del 14% per Airbnb. Non importa né sincronizza dati dei portali. "
+            "Per analisi attendibili serviranno esportazioni reali, costi effettivi, imposte e regole tariffarie."
+        )
